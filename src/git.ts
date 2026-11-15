@@ -28,8 +28,13 @@ const PKT_PAYLOAD_MAX = 65516;
 function pktLine(payload: string | Buffer): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const len = body.length + 4;
-  const head = Buffer.from(len.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, body]);
+  // One allocation instead of head + body + concat: the header is 4 ASCII
+  // hex digits and the body is copied in. pktLine is on every git response
+  // path (advertisements, fetch, reports), so the saving is per packet.
+  const out = Buffer.allocUnsafe(len);
+  out.write(len.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  body.copy(out, 4);
+  return out;
 }
 
 const PKT_FLUSH = Buffer.from('0000', 'ascii');
@@ -117,6 +122,64 @@ function sendBinary(
 }
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+
+// ---------------------------------------------------------------------------
+// response memoization
+//
+// A git response (advertisement, ls-refs, fetch) is a pure function of the
+// request bytes and the repo's (refs, objects) state: collectFetch,
+// handleLsRefs and v0Advertisement read nothing else — no clock, no counter
+// (the X-GitHub-Request-Id header is generated per response, outside the
+// body), and the pack writer is deterministic for the same objects. The key
+// therefore combines:
+//   - the raw request bytes (latin1 is a byte<->char bijection, so equal keys
+//     mean equal parsed requests; a merely different request can only miss,
+//     never false-hit — e.g. a different `filter` or capability line),
+//   - a snapshot of EVERY ref (name + tip oid), and
+//   - the object count.
+// The count is a sound proxy for the whole object set: objects are
+// content-addressed and immutable, and the store only ever ADDS them —
+// putObject/putObjectOid both guard with `!has`, and no code path anywhere
+// deletes an object or rewrites one's bytes (audited: the only `.objects.set`
+// sites are those two guarded puts; there is no `.objects.delete`/`.clear`).
+// So within one RepoRec lifetime the object set only grows, and equal size
+// means an equal set. Refs are snapshotted in full, so any ref move, create
+// or delete changes the key; the default branch (used in the symref caps)
+// is in the key too. The cache lives in a WeakMap keyed by the RepoRec
+// itself, so deleting a repo and recreating it under the same name gets a
+// fresh, empty cache — a new RepoRec — never a stale hit. All RepoRecs are
+// created only by Store.createRepo.
+// Bounded: at most 16 entries per repo, each at most 256 KiB; the oldest
+// entry is evicted. Receive-pack is NOT cached: it mutates the repo.
+
+const gitCache = new WeakMap<RepoRec, Map<string, Buffer>>();
+const GIT_CACHE_MAX_ENTRIES = 16;
+const GIT_CACHE_MAX_BODY = 256 * 1024;
+
+function repoStateKey(repo: RepoRec): string {
+  let key = `${repo.defaultBranch}\n${repo.objects.size}\n`;
+  for (const [name, oid] of sortedRefs(repo)) key += `${name}=${oid}\n`;
+  return key;
+}
+
+function gitCacheGet(repo: RepoRec, key: string): Buffer | undefined {
+  return gitCache.get(repo)?.get(key);
+}
+
+function gitCachePut(repo: RepoRec, key: string, body: Buffer): void {
+  if (body.length > GIT_CACHE_MAX_BODY) return;
+  let perRepo = gitCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, Buffer>();
+    gitCache.set(repo, perRepo);
+  }
+  if (perRepo.has(key)) return;
+  if (perRepo.size >= GIT_CACHE_MAX_ENTRIES) {
+    const oldest = perRepo.keys().next().value;
+    if (oldest !== undefined) perRepo.delete(oldest);
+  }
+  perRepo.set(key, body);
+}
 
 function sortedRefs(repo: RepoRec): [string, string][] {
   return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
@@ -380,9 +443,9 @@ function parsePack(
         base = resolveEntry(baseEntry);
       } else {
         const baseOid = entry.baseOid as string;
-        const inPack = [...resolvedByOid.entries()].find(([oid]) => oid === baseOid);
+        const inPack = resolvedByOid.get(baseOid);
         if (inPack !== undefined) {
-          base = inPack[1];
+          base = inPack;
         } else {
           base = resolveBase(baseOid);
           if (base === undefined) {
@@ -589,14 +652,22 @@ function collectFetch(
 // ---------------------------------------------------------------------------
 // sideband chunking (pack bytes -> pkt-lines with a 1-byte band prefix)
 
+/** One sideband band-1 packet: a 1-byte band prefix + data, single allocation. */
+function bandPacket(data: Buffer): Buffer {
+  const out = Buffer.allocUnsafe(data.length + 1);
+  out[0] = 1;
+  data.copy(out, 1);
+  return out;
+}
+
 function sidebandPackets(pack: Buffer): Buffer[] {
   const out: Buffer[] = [];
   const CHUNK = PKT_PAYLOAD_MAX - 1; // 1 byte band + data, payload <= 65516
   for (let off = 0; off < pack.length; off += CHUNK) {
     const slice = pack.subarray(off, Math.min(pack.length, off + CHUNK));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    out.push(pktLine(bandPacket(slice)));
   }
-  if (pack.length === 0) out.push(pktLine(Buffer.from([1])));
+  if (pack.length === 0) out.push(pktLine(bandPacket(Buffer.alloc(0))));
   return out;
 }
 
@@ -654,6 +725,9 @@ function v2Advertisement(): Buffer {
   ];
   return Buffer.concat(parts);
 }
+
+/** The v2 advertisement depends on nothing at all — one shared Buffer. */
+const V2_ADVERTISEMENT = v2Advertisement();
 
 /** Convert a relative deepen (N generations beyond the client's current
  *  shallow boundary) into an absolute depth from the wanted tips, as real
@@ -967,7 +1041,7 @@ function handleReceivePack(
   const CHUNK = PKT_PAYLOAD_MAX - 1;
   for (let off = 0; off < reportBytes.length; off += CHUNK) {
     const slice = reportBytes.subarray(off, Math.min(reportBytes.length, off + CHUNK));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    parts.push(pktLine(bandPacket(slice)));
   }
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
@@ -1011,12 +1085,18 @@ export const handleGit: SurfaceHandler = async (req, res, store) => {
         return true;
       }
       if (service === 'git-receive-pack') {
+        const cacheKey = `adv0|receive|${repoStateKey(repo)}`;
+        let adv = gitCacheGet(repo, cacheKey);
+        if (adv === undefined) {
+          adv = v0Advertisement(store, repo, service);
+          gitCachePut(repo, cacheKey, adv);
+        }
         sendBinary(
           res,
           store,
           200,
           'application/x-git-receive-pack-advertisement',
-          v0Advertisement(store, repo, service),
+          adv,
         );
       } else if ((req.headers['git-protocol'] ?? '') === 'version=2') {
         sendBinary(
@@ -1024,15 +1104,21 @@ export const handleGit: SurfaceHandler = async (req, res, store) => {
           store,
           200,
           'application/x-git-upload-pack-advertisement',
-          v2Advertisement(),
+          V2_ADVERTISEMENT,
         );
       } else {
+        const cacheKey = `adv0|upload|${repoStateKey(repo)}`;
+        let adv = gitCacheGet(repo, cacheKey);
+        if (adv === undefined) {
+          adv = v0Advertisement(store, repo, service);
+          gitCachePut(repo, cacheKey, adv);
+        }
         sendBinary(
           res,
           store,
           200,
           'application/x-git-upload-pack-advertisement',
-          v0Advertisement(store, repo, service),
+          adv,
         );
       }
       return true;
@@ -1059,7 +1145,14 @@ export const handleGit: SurfaceHandler = async (req, res, store) => {
           // v2 ls-refs: args follow the delim packet.
           const delimIdx = packets.findIndex((p) => p.kind === 'delim');
           const argPackets = delimIdx >= 0 ? packets.slice(delimIdx + 1) : [];
+          const cacheKey = `ls|${repoStateKey(repo)}|${raw.data.toString('latin1')}`;
+          const hit = gitCacheGet(repo, cacheKey);
+          if (hit !== undefined) {
+            sendBinary(res, store, 200, 'application/x-git-upload-pack-result', hit);
+            return true;
+          }
           body = handleLsRefs(store, repo, pktLines(argPackets));
+          gitCachePut(repo, cacheKey, body);
           sendBinary(res, store, 200, 'application/x-git-upload-pack-result', body);
           return true;
         }
@@ -1084,7 +1177,14 @@ export const handleGit: SurfaceHandler = async (req, res, store) => {
           if (deepenRelative && depth !== null) {
             depth = relativeToAbsoluteDepth(store, repo, wants, shallow, depth);
           }
+          const fetchKey = `f2|${repoStateKey(repo)}|${raw.data.toString('latin1')}`;
+          const fetchHit = gitCacheGet(repo, fetchKey);
+          if (fetchHit !== undefined) {
+            sendBinary(res, store, 200, 'application/x-git-upload-pack-result', fetchHit);
+            return true;
+          }
           body = buildFetchResponseV2(store, repo, wants, haves, shallow, depth);
+          gitCachePut(repo, fetchKey, body);
           sendBinary(res, store, 200, 'application/x-git-upload-pack-result', body);
           return true;
         }
@@ -1154,7 +1254,14 @@ export const handleGit: SurfaceHandler = async (req, res, store) => {
         if (deepenRelative && depth !== null) {
           depth = relativeToAbsoluteDepth(store, repo, wants, shallow, depth);
         }
+        const fetchKey = `f0|${repoStateKey(repo)}|${raw.data.toString('latin1')}`;
+        const fetchHit = gitCacheGet(repo, fetchKey);
+        if (fetchHit !== undefined) {
+          sendBinary(res, store, 200, 'application/x-git-upload-pack-result', fetchHit);
+          return true;
+        }
         body = buildFetchResponseV0(store, repo, wants, haves, shallow, depth, multiAck, done, section2);
+        gitCachePut(repo, fetchKey, body);
         sendBinary(res, store, 200, 'application/x-git-upload-pack-result', body);
         return true;
       } catch (err) {

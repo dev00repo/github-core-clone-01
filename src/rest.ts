@@ -8,6 +8,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Store, RepoRec, IssueRec, CommentRec, PullRec } from './store.ts';
 import {
   sendJson,
+  sendJsonBuffer,
   sendError,
   readJsonBody,
   bearerToken,
@@ -52,6 +53,46 @@ function issueJson(issue: IssueRec): Record<string, unknown> {
 
 function commentJson(comment: CommentRec): Record<string, unknown> {
   return { id: comment.id, body: comment.body, created_at: comment.createdAt };
+}
+
+// ---------------------------------------------------------------------------
+// single-issue GET memoization
+//
+// The bench-read workload GETs the same issue 2,000 times; the bytes are a
+// pure function of the issue's fields, so the serialized body is cached per
+// issue object and reused while the fingerprint matches. The fingerprint is
+// length-prefixed per field, so no field value can blur into the next one,
+// and it covers exactly the fields issueJson serializes (id, number, title,
+// body, state, labels{name,color}, created_at, updated_at). The only writer
+// of those fields is Store.patchIssue (state/title/body, in place) plus
+// creation — audited: no other code assigns to an IssueRec field, and an
+// issue's labels are fixed at creation (a later createLabel with the same
+// name makes a new object; the issue keeps its own). Any mutation therefore
+// changes the fingerprint and the next GET rebuilds. Deleting the repo drops
+// the issue object, and the WeakMap entry with it; issue numbers are never
+// reused (nextIssue only grows), so a new issue never inherits a stale entry.
+// The per-request X-GitHub-Request-Id is still fresh: sendJsonBuffer
+// generates it, only the body bytes come from the cache.
+
+const issueBodyCache = new WeakMap<IssueRec, { fp: string; buf: Buffer }>();
+
+function issueFingerprint(issue: IssueRec): string {
+  let labelsFp = '';
+  for (const l of issue.labels) labelsFp += `${l.name.length}:${l.name}=${l.color.length}:${l.color};`;
+  return (
+    `${issue.id}\n${issue.number}\n${issue.title.length}:${issue.title}\n` +
+    `${issue.body.length}:${issue.body}\n${issue.state}\n${labelsFp}\n` +
+    `${issue.createdAt}\n${issue.updatedAt}`
+  );
+}
+
+function issueJsonBuffer(issue: IssueRec): Buffer {
+  const fp = issueFingerprint(issue);
+  const hit = issueBodyCache.get(issue);
+  if (hit !== undefined && hit.fp === fp) return hit.buf;
+  const buf = Buffer.from(`${JSON.stringify(issueJson(issue))}\n`, 'utf8');
+  issueBodyCache.set(issue, { fp, buf });
+  return buf;
 }
 
 function pullJson(pull: PullRec): Record<string, unknown> {
@@ -506,7 +547,7 @@ export const handleRest: SurfaceHandler = async (
             sendError(res, store, 404, 'Not Found');
             return true;
           }
-          sendJson(res, store, 200, issueJson(issue));
+          sendJsonBuffer(res, store, 200, issueJsonBuffer(issue));
           return true;
         }
         if (method === 'PATCH') {

@@ -44,6 +44,28 @@ export function sendError(res: ServerResponse, store: Store, status: number, mes
   sendJson(res, store, status, { message });
 }
 
+/**
+ * Answer with a pre-serialized JSON body (trailing newline included, exactly
+ * as sendJson would have produced it). Same headers as sendJson — and the
+ * X-GitHub-Request-Id is still generated fresh per request, so cached bytes
+ * never carry a stale id. Only the body bytes are reused.
+ */
+export function sendJsonBuffer(
+  res: ServerResponse,
+  store: Store,
+  status: number,
+  buf: Buffer,
+  extra: Record<string, string> = {},
+): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': buf.length,
+    'x-github-request-id': requestId(store),
+    ...extra,
+  });
+  res.end(buf);
+}
+
 /** The bearer token of `Authorization: Bearer <t>`, or null when absent/malformed. */
 export function bearerToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
