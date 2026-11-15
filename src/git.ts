@@ -175,6 +175,27 @@ function encodeEntryHeader(typeCode: number, size: number): Buffer {
   return Buffer.from(out);
 }
 
+/**
+ * Deflated bytes by object data. Git objects are immutable once stored, and
+ * the store hands out the same Buffer instance for the same object, so the
+ * data Buffer itself is a sound key. A shallow clone serves the same 3
+ * objects 50 times over; the first clone pays the deflate, the rest hit.
+ * Level 1: the payloads here are ~40–512 bytes, where level 1 is ~a third
+ * faster than the default and the wire bytes stay deterministic (the client
+ * verifies the pack checksum against what it received, not a fixed size).
+ */
+const deflateCache = new Map<Buffer, Buffer>();
+const DEFLATE_CACHE_MAX = 8192;
+
+function deflateCached(data: Buffer): Buffer {
+  const hit = deflateCache.get(data);
+  if (hit !== undefined) return hit;
+  const out = deflateSync(data, { level: 1 });
+  if (deflateCache.size >= DEFLATE_CACHE_MAX) deflateCache.clear();
+  deflateCache.set(data, out);
+  return out;
+}
+
 function writePack(objects: { type: string; data: Buffer }[]): Buffer {
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
@@ -186,7 +207,7 @@ function writePack(objects: { type: string; data: Buffer }[]): Buffer {
     const typeCode = TYPE_CODES[obj.type];
     if (typeCode === undefined) continue;
     parts.push(encodeEntryHeader(typeCode, obj.data.length));
-    parts.push(deflateSync(obj.data));
+    parts.push(deflateCached(obj.data));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, sha1Buf(body)]);
@@ -877,7 +898,9 @@ function handleReceivePack(
     } else {
       try {
         const objects = parsePack(store, packBytes, (oid) => store.getObject(repo, oid));
-        for (const [, obj] of objects) store.putObject(repo, obj.type, obj.data);
+        // parsePack already hashed every object while resolving it; store
+        // by that oid instead of hashing each one a second time.
+        for (const [oid, obj] of objects) store.putObjectOid(repo, obj.type, obj.data, oid);
       } catch (err) {
         unpackOk = false;
         unpackDetail = err instanceof Error ? err.message : 'unpack failed';

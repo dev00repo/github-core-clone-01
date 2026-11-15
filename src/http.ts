@@ -29,14 +29,14 @@ export function sendJson(
   body: unknown,
   extra: Record<string, string> = {},
 ): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': requestId(store),
     ...extra,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 /** A JSON error body: {"message": "..."}. */
@@ -52,24 +52,52 @@ export function bearerToken(req: IncomingMessage): string | null {
   return match === null ? null : match[1];
 }
 
-/** Read the whole request body as bytes (cap 64 MiB by default). */
-export async function readRawBody(
+/**
+ * Read the whole request body as bytes (cap 64 MiB by default).
+ *
+ * Event-based accumulation, not `for await...of`: the async iterator's
+ * generator machinery costs ~10 us per body even when the body arrives in a
+ * single chunk, and every POST in the benchmark pays it. Same contract as
+ * before: too-big stops the stream and reports 'too-big', a stream error
+ * reports 'read-error'.
+ */
+export function readRawBody(
   req: IncomingMessage,
   cap = 64 * 1024 * 1024,
 ): Promise<{ ok: true; data: Buffer } | { ok: false; reason: string }> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  try {
-    for await (const chunk of req) {
-      const buf = chunk as Buffer;
-      size += buf.length;
-      if (size > cap) return { ok: false, reason: 'too-big' };
-      chunks.push(buf);
-    }
-  } catch {
-    return { ok: false, reason: 'read-error' };
-  }
-  return { ok: true, data: Buffer.concat(chunks) };
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    const finish = (result: { ok: true; data: Buffer } | { ok: false; reason: string }): void => {
+      if (done) return;
+      done = true;
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      resolve(result);
+    };
+    const onData = (chunk: Buffer): void => {
+      size += chunk.length;
+      if (size > cap) {
+        // The caller answers 400 and never needs the rest of the body.
+        // Destroying the stream mirrors the old for-await early return.
+        try {
+          req.destroy();
+        } catch {
+          // Already gone.
+        }
+        finish({ ok: false, reason: 'too-big' });
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = (): void => finish({ ok: true, data: Buffer.concat(chunks) });
+    const onError = (): void => finish({ ok: false, reason: 'read-error' });
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+  });
 }
 
 /**
@@ -90,22 +118,35 @@ export async function readJsonBody(
   }
 }
 
+/**
+ * The parsed URL of a request, cached per request object. The dispatcher,
+ * the REST handler and the git handler each need the path and the query,
+ * and `new URL()` costs ~1.6 us a parse — three parses per REST request
+ * for nothing. One parse, shared; identical results (same URL object).
+ */
+const parsedUrls = new WeakMap<IncomingMessage, URL | null>();
+
+function parsedUrl(req: IncomingMessage): URL | null {
+  const cached = parsedUrls.get(req);
+  if (cached !== undefined) return cached;
+  let parsed: URL | null;
+  try {
+    parsed = new URL(req.url ?? '/', 'http://entry');
+  } catch {
+    parsed = null;
+  }
+  parsedUrls.set(req, parsed);
+  return parsed;
+}
+
 /** The query string of a request, never throwing. */
 export function parseQuery(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  return parsedUrl(req)?.searchParams ?? new URLSearchParams();
 }
 
 /** The path of a request URL, or '/' when it does not parse (never throws). */
 export function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  return parsedUrl(req)?.pathname ?? '/';
 }
 
 /** decodeURIComponent, or null when the segment is not valid percent-encoding. */

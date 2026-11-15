@@ -5,6 +5,7 @@
 // Determinism: ids come from counters or SHA-1 of stable keys; timestamps come
 // only from MAKEFUN_TRIAL_NOW (see trialNow()). No wall clock, no Math.random.
 
+import { createHash } from 'node:crypto';
 import { sha1Hex } from './util.ts';
 import { deriveScenario } from './scenario.ts';
 
@@ -212,16 +213,28 @@ export class Store {
 
   // ------------------------------------------------------------ git objects
 
-  /** The object id for `type` + `data`: sha1("<type> <size>\0" + data). */
+  /**
+   * The object id for `type` + `data`: sha1("<type> <size>\0" + data).
+   * Two `.update()` calls instead of `Buffer.concat([header, data])`: the
+   * header is ASCII, so the hashed bytes are identical, and the copy is
+   * skipped — this runs once per object stored or received.
+   */
   oidFor(type: string, data: Buffer): string {
-    const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-    return sha1Hex(Buffer.concat([header, data]));
+    return createHash('sha1').update(`${type} ${data.length}\0`).update(data).digest('hex');
   }
 
   putObject(repo: RepoRec, type: string, data: Buffer): string {
     const oid = this.oidFor(type, data);
     if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
     return oid;
+  }
+
+  /**
+   * Store an object whose oid is already known (pack parsing computes it
+   * while resolving deltas). Skips the second hash `putObject` would do.
+   */
+  putObjectOid(repo: RepoRec, type: string, data: Buffer, oid: string): void {
+    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
   }
 
   getObject(repo: RepoRec, oid: string): GitObject | undefined {
