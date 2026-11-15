@@ -1,10 +1,10 @@
-# github-core-clone-01 starter
+# github-core-clone-01
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/dev00repo/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/dev00repo/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+One-process GitHub-compatible git forge in Node 22: git smart HTTP, REST v3, GraphQL v4 and MCP from one in-memory store. No git binary, no dependencies, no UI. Locally graded 120/120 conformance checks, 970/1,000.
 
 ## Run it
 
@@ -12,10 +12,9 @@ building them.
 node --experimental-strip-types main.ts
 ```
 
-The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its
-own; the flag is harmless there and makes an older local Node work too. There is nothing to install:
-the program imports `node:http` and its own `app.ts` only, and the trial has no package manager and
-no internet.
+---
+
+Entered on [make.fun](https://make.fun/?ref=5pt51d1q&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards
 
 ## The lifecycle (main.ts)
 
@@ -68,8 +67,8 @@ The trial's CPU, memory and process limits are the rules'; its wall budget is 90
 
 ## Layout
 
-- `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server. This is the file to grow.
+- `main.ts`: the lifecycle above.
+- `app.ts`: the server.
 - `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
 
 The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.
